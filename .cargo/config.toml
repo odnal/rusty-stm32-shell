@@ -1,0 +1,13 @@
+[build]
+target = "thumbv7em-none-eabi"
+
+# Compilation flags for rustc here per the target
+[target.thumbv7em-none-eabi]
+rustflags = [
+    "-C", "link-arg=-g",
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=-nostdlib",
+    "-C", "link-arg=target/thumbv7em-none-eabi/debug/boot.o",
+    "-C", "linker=arm-none-eabi-ld",
+]
+
