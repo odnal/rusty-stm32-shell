@@ -1,6 +1,6 @@
 #![no_main]
 #![no_std]
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::{read, read_volatile, write_volatile};
 use core::panic::PanicInfo;
 
 extern "C" {
@@ -55,8 +55,9 @@ impl GPIOops for GPIO_t {
 
     fn config_aflr(&self, pin: u8, af: u8) {
         unsafe {
+            let mut ra = read_volatile(self.aflr_r);
             let bit_field = (pin * 4) as u32;
-            write_volatile(self.aflr_r, (af as u32) << bit_field);
+            write_volatile(self.aflr_r, ra | (af as u32) << bit_field);
         }
     }
 }
@@ -68,6 +69,7 @@ struct UART {
     usart_brr: *mut u32,
     usart_isr: *mut u32,
     usart_tdr: *mut u32,
+    usart_rdr: *mut u32,
 }
 
 trait UARTops {
@@ -75,6 +77,7 @@ trait UARTops {
     fn config_buadrate(&self, usart_div: u16); // some math formula in ds to figure this. #todo for later.
     fn config_data_length(&self, m0_bit: u8, m1_bit: u8);
     fn send_byte(&self, byte: u8);
+    fn read_byte(&self) -> u8;
 }
 
 impl UARTops for UART {
@@ -101,6 +104,13 @@ impl UARTops for UART {
             write_volatile(self.usart_tdr, byte as u32);
         }
     }
+
+    fn read_byte(&self) -> u8 {
+        unsafe {
+            while (read_volatile(self.usart_isr) & 0x20) == 0 {}
+            return (read_volatile(self.usart_rdr) & 0xFF) as u8;
+        }
+    }
 }
 
 #[no_mangle]
@@ -119,7 +129,9 @@ pub extern "C" fn main() {
 
         // Configure GPIO
         gpio_a.set_mode(0, 2); // pin A0 (tx) set to alternate function mode b'10'
-        gpio_a.config_aflr(GpioPort::A as u8, 8);
+        gpio_a.set_mode(1, 2); // pin A1 (rx) set to alternate function mode b'10'
+        gpio_a.config_aflr(0, 8);
+        gpio_a.config_aflr(1, 8);
 
         // Configure UART Only TX side to transmit data out the tx pin to an FTDI device so that we can see the data printed in a virtual com port.
         let uart = UART {
@@ -128,6 +140,7 @@ pub extern "C" fn main() {
             usart_cr3: (UART4_BASE + 0x08) as *mut u32,
             usart_brr: (UART4_BASE + 0x0C) as *mut u32,
             usart_isr: (UART4_BASE + 0x1C) as *mut u32,
+            usart_rdr: (UART4_BASE + 0x24) as *mut u32,
             usart_tdr: (UART4_BASE + 0x28) as *mut u32,
         };
 
@@ -137,7 +150,7 @@ pub extern "C" fn main() {
         ra ^= (1<<28) | (1<<12);
         write_volatile(uart.usart_cr1, ra);
 
-        uart.config_buadrate(0x0022); // 115200 did the maths awhile ago
+        uart.config_buadrate(0x1a0); // 9600 buad
         uart.config_cr_reg(uart.usart_cr1, 0); // Enable UART
 
         // Set TE bit to send idle frame
@@ -145,16 +158,16 @@ pub extern "C" fn main() {
         ra |= 1<<3;
         write_volatile(uart.usart_cr1, ra);
 
+        // Set RE bit
+        ra = read_volatile(uart.usart_cr1);
+        ra |= 1 << 2;
+        write_volatile(uart.usart_cr1, ra);
+
         let running = true;
         while running {
+            let byte = uart.read_byte();
             while (read_volatile(uart.usart_isr) & 0x40) == 0 {}
-            uart.send_byte(0x55);
-            while (read_volatile(uart.usart_isr) & 0x40) == 0 {}
-            uart.send_byte(0x0D);
-            while (read_volatile(uart.usart_isr) & 0x40) == 0 {}
-            uart.send_byte(0x0A);
-
-            for _ in 0..10000 {}
+            uart.send_byte(byte); // echo received byte
         }
     }
 }
