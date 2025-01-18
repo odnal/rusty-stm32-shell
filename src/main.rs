@@ -1,11 +1,10 @@
 #![no_main]
 #![no_std]
-use core::ptr::{read, read_volatile, write_volatile};
+use core::ptr::{read_volatile, write_volatile};
 use core::panic::PanicInfo;
 
 extern "C" {
     fn _start();
-    #[allow(dead_code)]
     fn dummy(_: u32);
 }
 
@@ -55,7 +54,7 @@ impl GPIOops for GPIO_t {
 
     fn config_aflr(&self, pin: u8, af: u8) {
         unsafe {
-            let mut ra = read_volatile(self.aflr_r);
+            let ra = read_volatile(self.aflr_r);
             let bit_field = (pin * 4) as u32;
             write_volatile(self.aflr_r, ra | (af as u32) << bit_field);
         }
@@ -73,17 +72,23 @@ struct UART {
 }
 
 trait UARTops {
-    fn config_cr_reg(&self, cr: *mut u32, reg_bit: u8);
-    fn config_buadrate(&self, usart_div: u16); // some math formula in ds to figure this. #todo for later.
-    fn config_data_length(&self, m0_bit: u8, m1_bit: u8);
+    fn config_cr_reg(&self, cr: *mut u32, reg_bit: u8, val: u8);
+    fn config_buadrate(&self, usart_div: u16);
     fn send_byte(&self, byte: u8);
     fn read_byte(&self) -> u8;
 }
 
 impl UARTops for UART {
-    fn config_cr_reg(&self, cr: *mut u32, reg_bit: u8) {
+    fn config_cr_reg(&self, cr: *mut u32, reg_bit: u8, val: u8) {
         unsafe {
-            write_volatile(cr, 1 << reg_bit);
+            let mut ra = read_volatile(cr);
+            if val == 0 {
+                ra |= (1 << reg_bit) as u32;
+                ra ^= (1 << reg_bit) as u32;
+            } else {
+                ra |= (val << reg_bit) as u32;
+            }
+            write_volatile(cr, ra);
         }
     }
 
@@ -93,14 +98,9 @@ impl UARTops for UART {
         }
     }
 
-    fn config_data_length(&self, m0_bit: u8, m1_bit: u8) {
-        unsafe {
-            todo!();
-        }
-    }
-
     fn send_byte(&self, byte: u8) {
         unsafe {
+            while (read_volatile(self.usart_isr) & 0x80) == 0 {};
             write_volatile(self.usart_tdr, byte as u32);
         }
     }
@@ -115,7 +115,8 @@ impl UARTops for UART {
 
 #[no_mangle]
 pub extern "C" fn main() {
-    let mut ra;
+
+    let mut cursor_pos = 0;
 
     unsafe {
         // Init clocks
@@ -133,7 +134,6 @@ pub extern "C" fn main() {
         gpio_a.config_aflr(0, 8);
         gpio_a.config_aflr(1, 8);
 
-        // Configure UART Only TX side to transmit data out the tx pin to an FTDI device so that we can see the data printed in a virtual com port.
         let uart = UART {
             usart_cr1: (UART4_BASE + 0x00) as *mut u32,
             usart_cr2: (UART4_BASE + 0x04) as *mut u32,
@@ -145,29 +145,53 @@ pub extern "C" fn main() {
         };
 
         // transmission flowcontrol 8 data bits
-        ra = read_volatile(uart.usart_cr1);
-        ra |= (1<<28) | (1<<12);
-        ra ^= (1<<28) | (1<<12);
-        write_volatile(uart.usart_cr1, ra);
+        uart.config_cr_reg(uart.usart_cr1, 28, 0);
+        uart.config_cr_reg(uart.usart_cr1, 12, 0);
 
         uart.config_buadrate(0x1a0); // 9600 buad
-        uart.config_cr_reg(uart.usart_cr1, 0); // Enable UART
-
-        // Set TE bit to send idle frame
-        ra = read_volatile(uart.usart_cr1);
-        ra |= 1<<3;
-        write_volatile(uart.usart_cr1, ra);
-
-        // Set RE bit
-        ra = read_volatile(uart.usart_cr1);
-        ra |= 1 << 2;
-        write_volatile(uart.usart_cr1, ra);
+        uart.config_cr_reg(uart.usart_cr1, 0, 1); // Enable UART bit
+        uart.config_cr_reg(uart.usart_cr1, 3, 1); // Enable TE bit
+        uart.config_cr_reg(uart.usart_cr1, 2, 1); // Enable RE bit
 
         let running = true;
         while running {
             let byte = uart.read_byte();
             while (read_volatile(uart.usart_isr) & 0x40) == 0 {}
-            uart.send_byte(byte); // echo received byte
+
+            // TODO: use ansci escape code (erase functions) to clear from the cursor position -1 to
+            // end of line. And then improve to clear from cursor position -1 to cursor position.
+            // (i.e "hell[o] world" - delete 'hell' but not "o world") something like a ctrl-w
+            match byte {
+                0x08 | 0x7F => {
+                    if cursor_pos > 0 {
+                        uart.send_byte(0x08);
+                        uart.send_byte(b' ');
+                        uart.send_byte(0x08);
+                        cursor_pos -= 1;
+                    }
+                }
+                b'\r' | b'\n' => {
+                    uart.send_byte(b'\r'); 
+                    uart.send_byte(b'\n'); 
+                    cursor_pos = 0;
+                }
+                0x15 => {
+                    // Clear entire line
+                    uart.send_byte(0x1B);
+                    uart.send_byte(b'[');
+                    uart.send_byte(b'2');
+                    uart.send_byte(b'K');
+                    // Move cursor to 0th column
+                    uart.send_byte(0x1B);
+                    uart.send_byte(b'[');
+                    uart.send_byte(0);
+                    uart.send_byte(b'G');
+                }
+                _ => {
+                    uart.send_byte(byte); 
+                    cursor_pos += 1;
+                }
+            }
         }
     }
 }
