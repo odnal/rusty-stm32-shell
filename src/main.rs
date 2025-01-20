@@ -76,6 +76,7 @@ trait UARTops {
     fn config_buadrate(&self, usart_div: u16);
     fn send_byte(&self, byte: u8);
     fn read_byte(&self) -> u8;
+    fn send_str(&self, s: &str);
 }
 
 impl UARTops for UART {
@@ -100,7 +101,7 @@ impl UARTops for UART {
 
     fn send_byte(&self, byte: u8) {
         unsafe {
-            while (read_volatile(self.usart_isr) & 0x80) == 0 {};
+            while (read_volatile(self.usart_isr) & 0x40) == 0 {};
             write_volatile(self.usart_tdr, byte as u32);
         }
     }
@@ -111,12 +112,79 @@ impl UARTops for UART {
             return (read_volatile(self.usart_rdr) & 0xFF) as u8;
         }
     }
+
+    fn send_str(&self, s: &str) {
+        for c in s.as_bytes() {
+            self.send_byte(*c);
+        }
+    }
+}
+
+const BS: u8 = 0x08;
+const DEL: u8 = 0x7F;
+const CTRL_U: u8 = 0x15;
+const CTRL_W: u8 = 0x17;
+
+fn reset_buffer(line_buffer: &mut [u8]) {
+    for i in 0..line_buffer.len() {
+        line_buffer[i] = b'\0';
+    }
+}
+
+fn clear_line(uart: &UART, line_buffer: &mut [u8]) {
+    uart.send_str("\x1b[2K"); // Clear entire line
+    uart.send_str("\x1b[0G"); // Move cursor to 0th column
+    reset_buffer(line_buffer);
+}
+
+
+fn delete_word(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
+    if *cursor_pos == 0 {
+        return;
+    }
+    let mut temp_pos = *cursor_pos;
+    while temp_pos != 0 && line_buffer[temp_pos] != b' ' {
+        temp_pos -= 1;
+    }
+
+    if temp_pos == 0 {
+        clear_line(&uart, line_buffer);
+    } else {
+        while temp_pos > 0 && line_buffer[temp_pos-1] == b' ' {
+            temp_pos -= 1;
+        }
+
+        if temp_pos == 0 {
+            clear_line(&uart, line_buffer);
+        }
+
+        uart.send_str("\x1b[2K"); // Clear entire line
+        uart.send_str("\x1b[0G"); // Move cursor to 0th column
+
+        // update line_buffer content
+        for i in temp_pos+1..*cursor_pos {
+            line_buffer[i] = b'\0';
+        }
+        // display the updated content
+        for i in 0..temp_pos+1 {
+            uart.send_byte(line_buffer[i]);
+        }
+    }
+
+    *cursor_pos = if temp_pos == 0 { 0 } else{ temp_pos+1 };
+}
+
+fn display_char(uart: &UART, byte: u8, line_buffer: &mut [u8], cursor_pos: &mut usize) {
+    uart.send_byte(byte); 
+    line_buffer[*cursor_pos] = byte;
+    *cursor_pos += 1;
 }
 
 #[no_mangle]
 pub extern "C" fn main() {
 
     let mut cursor_pos = 0;
+    let mut line_buffer: [u8; 528] = [b'\0'; 528];
 
     unsafe {
         // Init clocks
@@ -158,38 +226,30 @@ pub extern "C" fn main() {
             let byte = uart.read_byte();
             while (read_volatile(uart.usart_isr) & 0x40) == 0 {}
 
-            // TODO: use ansci escape code (erase functions) to clear from the cursor position -1 to
-            // end of line. And then improve to clear from cursor position -1 to cursor position.
-            // (i.e "hell[o] world" - delete 'hell' but not "o world") something like a ctrl-w
             match byte {
-                0x08 | 0x7F => {
+                BS | DEL => {
                     if cursor_pos > 0 {
-                        uart.send_byte(0x08);
-                        uart.send_byte(b' ');
-                        uart.send_byte(0x08);
+                        uart.send_str("\x08 \x08");
                         cursor_pos -= 1;
+                        line_buffer[cursor_pos] = b'\0';
                     }
                 }
                 b'\r' | b'\n' => {
-                    uart.send_byte(b'\r'); 
-                    uart.send_byte(b'\n'); 
+                    uart.send_str("\r\n");
+                    if cursor_pos > 0 {
+                        cursor_pos = 0;
+                        reset_buffer(&mut line_buffer);
+                    }
+                }
+                CTRL_U => {
+                    clear_line(&uart, &mut line_buffer);
                     cursor_pos = 0;
                 }
-                0x15 => {
-                    // Clear entire line
-                    uart.send_byte(0x1B);
-                    uart.send_byte(b'[');
-                    uart.send_byte(b'2');
-                    uart.send_byte(b'K');
-                    // Move cursor to 0th column
-                    uart.send_byte(0x1B);
-                    uart.send_byte(b'[');
-                    uart.send_byte(0);
-                    uart.send_byte(b'G');
+                CTRL_W => {
+                    delete_word(&uart, &mut line_buffer, &mut cursor_pos);
                 }
                 _ => {
-                    uart.send_byte(byte); 
-                    cursor_pos += 1;
+                    display_char(&uart, byte, &mut line_buffer, &mut cursor_pos);
                 }
             }
         }
