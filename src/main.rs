@@ -131,10 +131,27 @@ fn reset_buffer(line_buffer: &mut [u8]) {
     }
 }
 
-fn clear_line(uart: &UART, line_buffer: &mut [u8]) {
+fn handle_backspace(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
+    if *cursor_pos > 0 {
+        uart.send_str("\x08 \x08");
+        *cursor_pos -= 1;
+        line_buffer[*cursor_pos] = b'\0';
+    }
+}
+
+fn handle_newline(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
+    uart.send_str("\r\n");
+    if *cursor_pos > 0 {
+        *cursor_pos = 0;
+        reset_buffer(line_buffer);
+    }
+}
+
+fn clear_line(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
     uart.send_str("\x1b[2K"); // Clear entire line
     uart.send_str("\x1b[0G"); // Move cursor to 0th column
     reset_buffer(line_buffer);
+    *cursor_pos = 0;
 }
 
 
@@ -148,14 +165,16 @@ fn delete_word(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
     }
 
     if temp_pos == 0 {
-        clear_line(&uart, line_buffer);
+        clear_line(&uart, line_buffer, cursor_pos);
+        return;
     } else {
         while temp_pos > 0 && line_buffer[temp_pos-1] == b' ' {
             temp_pos -= 1;
         }
 
         if temp_pos == 0 {
-            clear_line(&uart, line_buffer);
+            clear_line(&uart, line_buffer, cursor_pos);
+            return;
         }
 
         uart.send_str("\x1b[2K"); // Clear entire line
@@ -171,7 +190,7 @@ fn delete_word(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
         }
     }
 
-    *cursor_pos = if temp_pos == 0 { 0 } else{ temp_pos+1 };
+    *cursor_pos = temp_pos+1;
 }
 
 fn display_char(uart: &UART, byte: u8, line_buffer: &mut [u8], cursor_pos: &mut usize) {
@@ -228,22 +247,13 @@ pub extern "C" fn main() {
 
             match byte {
                 BS | DEL => {
-                    if cursor_pos > 0 {
-                        uart.send_str("\x08 \x08");
-                        cursor_pos -= 1;
-                        line_buffer[cursor_pos] = b'\0';
-                    }
+                    handle_backspace(&uart, &mut line_buffer, &mut cursor_pos);
                 }
                 b'\r' | b'\n' => {
-                    uart.send_str("\r\n");
-                    if cursor_pos > 0 {
-                        cursor_pos = 0;
-                        reset_buffer(&mut line_buffer);
-                    }
+                    handle_newline(&uart, &mut line_buffer, &mut cursor_pos);
                 }
                 CTRL_U => {
-                    clear_line(&uart, &mut line_buffer);
-                    cursor_pos = 0;
+                    clear_line(&uart, &mut line_buffer, &mut cursor_pos);
                 }
                 CTRL_W => {
                     delete_word(&uart, &mut line_buffer, &mut cursor_pos);
