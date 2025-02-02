@@ -13,6 +13,17 @@ fn panic_handler(_: &PanicInfo) -> ! {
     loop {}
 }
 
+#[macro_export]
+macro_rules! shift {
+    ($src: expr, $src_sz: expr) => {{
+        core::assert!(*$src_sz > 0);
+        *$src_sz -= 1;
+        let first = $src[0];
+        *$src = &$src[1..];
+        first
+    }};
+}
+
 const RCC_BASE: u32 = 0x40021000;
 const RCC_AHB2ENR: *mut u32 = (RCC_BASE + 0x4C) as *mut u32;  // GPIO Clock Bus
 const RCC_APB1ENR1: *mut u32 = (RCC_BASE + 0x58) as *mut u32; // UART Clock Bus
@@ -140,20 +151,21 @@ fn handle_backspace(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize)
 }
 
 fn handle_newline(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
-    uart.send_str("\r\n");
-    if *cursor_pos > 0 {
-        *cursor_pos = 0;
-        reset_buffer(line_buffer);
-    }
-}
-
-fn clear_line(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
-    uart.send_str("\x1b[2K"); // Clear entire line
-    uart.send_str("\x1b[0G"); // Move cursor to 0th column
-    reset_buffer(line_buffer);
+    line_buffer[*cursor_pos] = b'\r';
+    line_buffer[*cursor_pos+1] = b'\n';
     *cursor_pos = 0;
 }
 
+fn clear_line(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
+    if *cursor_pos == 0 {
+        return;
+    }
+    uart.send_str("\x1b[2K"); // Clear entire line
+    uart.send_str("\x1b[0G"); // Move cursor to 0th column
+    uart.send_str("> ");
+    reset_buffer(line_buffer);
+    *cursor_pos = 0;
+}
 
 fn delete_word(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
     if *cursor_pos == 0 {
@@ -179,6 +191,7 @@ fn delete_word(uart: &UART, line_buffer: &mut [u8], cursor_pos: &mut usize) {
 
         uart.send_str("\x1b[2K"); // Clear entire line
         uart.send_str("\x1b[0G"); // Move cursor to 0th column
+        uart.send_str("> ");
 
         // update line_buffer content
         for i in temp_pos+1..*cursor_pos {
@@ -197,6 +210,114 @@ fn display_char(uart: &UART, byte: u8, line_buffer: &mut [u8], cursor_pos: &mut 
     uart.send_byte(byte); 
     line_buffer[*cursor_pos] = byte;
     *cursor_pos += 1;
+}
+
+fn process_command_line_buffer(line_buffer: &mut [u8]) -> (usize, [&str; 528]) {
+    let mut argc = 0;
+    let mut argv: [&str; 528] =[""; 528];
+    let mut start_word = 0;
+
+    // TODO: implement strip function for processing the line_buffer for cases where there is multiple spaces in the line
+    // clean up this messy code too eww..
+    for i in 0..line_buffer.len() {
+        if line_buffer[i] == b' ' {
+            if let Ok(word) = core::str::from_utf8(&line_buffer[start_word..i]) {
+                argv[argc] = word;
+                argc += 1;
+            }
+            if line_buffer[i+1] != b' ' {
+                start_word = i + 1;
+            }
+        } else if line_buffer[i] != b' ' {
+            if line_buffer[i+1] == b'\0' {
+                if let Ok(word) = core::str::from_utf8(&line_buffer[start_word..i+1]) {
+                    argv[argc] = word;
+                    break;
+                }
+            }
+            else if line_buffer[i+1] == b'\r' && line_buffer[i+2] == b'\n' {
+                if let Ok(word) = core::str::from_utf8(&line_buffer[start_word..i+1]) {
+                    argv[argc] = word;
+                    argc += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    return (argc, argv)
+}
+
+fn append_to_buffer<'a>(buffer: &mut [&'a str], data: &'a str) {
+    for i in 0..buffer.len() {
+        if buffer[i] == "" {
+            buffer[i] = data;
+            return;
+        }
+    }
+}
+
+fn parse_command_line_args(uart: &UART, argc: &mut usize, argv: &mut &[&str]) {
+    if *argc > 0 {
+        let command_name = shift!(argv, argc);
+        match command_name {
+            "clear" => {
+                uart.send_str("\x1b[2J");
+            }
+            "echo" => {
+                if *argc <= 0 {
+                    uart.send_str("\r\n");
+                    uart.send_str(" ");
+                    uart.send_str("\r\n");
+                } else {
+                    let mut temp = [""; 64];
+                    while *argc > 0 {
+                        append_to_buffer(&mut temp, shift!(argv, argc));
+                        if *argc > 0 {
+                            append_to_buffer(&mut temp, " ");
+                        }
+                    }
+                    let mut args_buf = [0u8; 256];
+                    let mut pos = 0;
+                    for i in 0..temp.len() {
+                        let bytes = temp[i].as_bytes();
+                        if pos + bytes.len() < args_buf.len() {
+                            args_buf[pos..pos + bytes.len()].copy_from_slice(bytes);
+                            pos += bytes.len();
+                        }
+                    }
+                    uart.send_str("\r\n");
+                    uart.send_str(core::str::from_utf8(&args_buf[..pos]).unwrap());
+                    uart.send_str("\r\n");
+                }
+            }
+            "help" => {
+                if *argc <= 0 {
+                    uart.send_str("\r\n    Command summary:\r\n");
+                    uart.send_str("      clear             ");
+                    uart.send_str("Clear the entire screen.\r\n");
+                    uart.send_str("      echo             ");
+                    uart.send_str(" Write arguments to standard output.\r\n");
+                    uart.send_str("      help             ");
+                    uart.send_str(" Show help overview or information about builtin commands.\r\n");
+                    uart.send_str("      quit             ");
+                    uart.send_str(" Exit the console.\r\n");
+                } else {
+                    // TODO: implement help overview for specific commands - which provide a little more detail. i.e ("help help")
+                    uart.send_str("\r\nNOT IMPLEMENTED\r\n");
+                }
+            }
+            "quit" => {
+                uart.send_str("\r\nNOT IMPLEMENTED\r\n");
+            }
+            _ => {
+                uart.send_str("\r\n");
+                uart.send_str("unknown command: ");
+                uart.send_str(command_name);
+                uart.send_str("\r\n");
+            }
+        }
+    }
 }
 
 #[no_mangle]
@@ -240,6 +361,11 @@ pub extern "C" fn main() {
         uart.config_cr_reg(uart.usart_cr1, 3, 1); // Enable TE bit
         uart.config_cr_reg(uart.usart_cr1, 2, 1); // Enable RE bit
 
+        // Initial Boot
+        uart.send_str("\r\nSTM32 Shell Console v0.0\r\n");
+        uart.send_str("Sytem ready. Type 'help' for commands.\r\n");
+        uart.send_str("> ");
+
         let running = true;
         while running {
             let byte = uart.read_byte();
@@ -250,7 +376,15 @@ pub extern "C" fn main() {
                     handle_backspace(&uart, &mut line_buffer, &mut cursor_pos);
                 }
                 b'\r' | b'\n' => {
+                    if line_buffer[0] == b'\0' {
+                        uart.send_str("\r\n");
+                    }
                     handle_newline(&uart, &mut line_buffer, &mut cursor_pos);
+                    let mut temp_buffer = line_buffer;
+                    let (mut argc, argv) = process_command_line_buffer(&mut temp_buffer);
+                    reset_buffer(&mut line_buffer);
+                    parse_command_line_args(&uart, &mut argc, &mut &argv[..]);
+                    uart.send_str("> ");
                 }
                 CTRL_U => {
                     clear_line(&uart, &mut line_buffer, &mut cursor_pos);
